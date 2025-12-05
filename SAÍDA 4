@@ -1,0 +1,181 @@
+import motor_pair, math, runloop, motor
+from hub import port, motion_sensor
+import time
+
+# --- Configuração dos motores ---
+motor_esquerdo = port.A
+motor_direito = port.B
+motor_pair.pair(motor_pair.PAIR_1, motor_esquerdo, motor_direito)
+
+# --- Parâmetros físicos dos componentes do robô ---
+raio_roda_cm = 2.8
+circunferencia_roda = 2 * math.pi * raio_roda_cm
+bitola = 12.5# distância entre as rodas
+
+# --- PID (para manter reta) ---
+Kp = 0.85
+Ki = 0.0015
+Kd = 0.75
+erro_passado = 0
+soma_erros = 0
+velocidade_base = 800# velocidade base dos motores
+
+# ---------------------------------------------------
+#MOVIMENTO RETO CONTÍNUO COM PID (em cm)
+# ---------------------------------------------------
+async def mover_em_linha_cm(distancia_cm, velocidade_cm_s):
+    global erro_passado, soma_erros
+    motion_sensor.reset_yaw(0)
+    erro_passado = 0
+    soma_erros = 0
+
+    # Determina o sentido do movimento
+    direcao = 1 if distancia_cm >= 0 else -1
+
+    # Calcula a distância alvo em graus
+    rotacoes = abs(distancia_cm) / circunferencia_roda
+    graus_totais = rotacoes * 360
+
+    # Inicializa contadores do PID em linha reta
+    inicio = time.ticks_ms()
+    graus_percorridos = 0
+    tempo_anterior = inicio
+
+    while graus_percorridos < graus_totais:
+        angulo_atual = motion_sensor.tilt_angles()[0]
+        erro = 0 - angulo_atual
+
+        soma_erros += erro
+        variacao_erro = erro - erro_passado
+        ajuste = Kp * erro + Ki * soma_erros + Kd * variacao_erro
+        ajuste = max(min(ajuste, 1000), -1000)
+
+        # Aplica velocidades corrigidas com direção
+        velocidade_esquerda = direcao * (velocidade_base - ajuste)
+        velocidade_direita = direcao * (velocidade_base + ajuste)
+
+        motor_pair.move_tank(
+            motor_pair.PAIR_1,
+            int(velocidade_esquerda),
+            int(velocidade_direita)
+        )
+
+        tempo_atual = time.ticks_ms()
+        delta_t = time.ticks_diff(tempo_atual, tempo_anterior) / 1000
+        media_vel = (abs(velocidade_esquerda) + abs(velocidade_direita)) / 2
+        graus_percorridos += media_vel * delta_t
+        tempo_anterior = tempo_atual
+
+        erro_passado = erro
+        await runloop.sleep_ms(5)
+
+    motor_pair.stop(motor_pair.PAIR_1)
+
+# ------------------
+#CURVA SIMPLES - CURVAS NO PRÓPIO EIXO
+# ------------------
+def curva_simples(angulo, raio_cm, velocidade_motor):
+    rad = math.radians(angulo)
+    arco = (angulo / 360) * 2 * math.pi * raio_cm
+    circ_roda = 2 * math.pi * raio_roda_cm
+    rotacao_motor = (arco / circ_roda) * 360
+
+    if angulo < 0:
+        motor_pair.move_tank_for_degrees(
+            motor_pair.PAIR_1,
+            int(rotacao_motor),
+            int(-velocidade_motor),
+            int(velocidade_motor)
+        )
+    else:
+        motor_pair.move_tank_for_degrees(
+            motor_pair.PAIR_1,
+            int(rotacao_motor),
+            int(velocidade_motor),
+            int(-velocidade_motor)
+        )
+
+# ------------------
+# CURVA COM BITOLA - COM MOVIMENTO EM PARÁBOLA
+# ------------------
+def curva_com_bitola(angulo, raio_cm, velocidade_externa, lado):
+    raio_interno = raio_cm - (bitola / 2)
+    raio_externo = raio_cm + (bitola / 2)
+
+    arco_interno = (angulo / 360) * 2 * math.pi * raio_interno
+    arco_externo = (angulo / 360) * 2 * math.pi * raio_externo
+
+    circ_roda = 2 * math.pi * raio_roda_cm
+    rotacao_interna = (arco_interno / circ_roda) * 360
+    rotacao_externa = (arco_externo / circ_roda) * 360
+
+    velocidade_interna = velocidade_externa * (rotacao_interna / rotacao_externa)
+
+    if lado.lower() == "direita":
+        motor_pair.move_tank_for_degrees(
+            motor_pair.PAIR_1,
+            int(rotacao_externa),
+            int(velocidade_externa),
+            int(velocidade_interna)
+        )
+    elif lado.lower() == "esquerda":
+        motor_pair.move_tank_for_degrees(
+            motor_pair.PAIR_1,
+            int(rotacao_externa),
+            int(velocidade_interna),
+            int(velocidade_externa)
+        )
+
+
+# ------------------------
+# SEQUÊNCIA DE EXECUÇÃO
+# ------------------------
+async def main():
+    await mover_em_linha_cm(40.5, 1000)# Dirige-se até a missão 8
+    time.sleep(2.5)
+    curva_simples(7, 12.5, 300)
+    time.sleep(1)# estabilização
+    motion_sensor.reset_yaw(0)
+
+    # Execução da missão 8 #
+    for sobe_desce in range(1, 5):
+        motor.run(port.D, -1000)
+        time.sleep(0.5)
+        motor.stop(port.D)
+        time.sleep(0.5)
+        motor.run(port.D, 500)
+        time.sleep(0.25)
+        sobe_desce
+    motor.stop(port.D)
+    time.sleep(2)
+    ##
+    curva_simples(12, -16, 300)
+    time.sleep(0.8)# estabilização
+    motion_sensor.reset_yaw(0)
+    time.sleep(0.2)
+    curva_com_bitola(180, 35, 800, 'direita')# Dirige-se até a missão 6
+    time.sleep(0.87)
+    motor_pair.stop(motor_pair.PAIR_1)
+    time.sleep(1)
+    curva_simples(24, -12.5, 600)# Vira se posicionando à missão 6
+    time.sleep(1)
+    motion_sensor.reset_yaw(0)
+    time.sleep(0.5)
+    curva_com_bitola(107,12.2,600,'esquerda')
+    time.sleep(2.4)
+    await mover_em_linha_cm(-10,300)
+    time.sleep(1)
+    curva_com_bitola(22.5,0,600,'esquerda')
+    time.sleep(2) 
+    await mover_em_linha_cm(-10,800)   
+    time.sleep(1)
+    curva_com_bitola(10.5,0,600,'esquerda')
+    time.sleep(2)
+    await mover_em_linha_cm(10,800)
+    time.sleep(1)    
+    await mover_em_linha_cm(50,300)
+    time.sleep(1)
+    curva_simples(80,7.5,300)
+    time.sleep(1)
+runloop.run(main())
+
